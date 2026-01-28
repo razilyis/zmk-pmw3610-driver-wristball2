@@ -77,11 +77,11 @@ static inline void rotate_xy_45step(int16_t in_x, int16_t in_y, uint16_t deg,
     if (r == 135 || r == 225) c = -c;
     if (r == 225 || r == 315) s = -s;
 
-    int32_t X = in_x;
-    int32_t Y = in_y;
+    int32_t ix = in_x;
+    int32_t iy = in_y;
 
-    int32_t xo = q15_mul(X, c) - q15_mul(Y, s);
-    int32_t yo = q15_mul(X, s) + q15_mul(Y, c);
+    int32_t xo = q15_mul(ix, c) - q15_mul(iy, s);
+    int32_t yo = q15_mul(ix, s) + q15_mul(iy, c);
 
     // 念のためクリップ（安全策）
     if (xo > INT16_MAX) xo = INT16_MAX;
