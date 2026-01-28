@@ -31,9 +31,24 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(pmw3610, CONFIG_INPUT_LOG_LEVEL);
 
-// 外部からアクセス可能なorientation関数の宣言
-extern uint16_t pmw3610_get_orientation(void);
-extern void pmw3610_set_orientation(uint16_t orientation);
+// ==========================================
+// 修正箇所: 角度管理変数をドライバ内で定義
+// ==========================================
+static uint16_t driver_pmw_orientation = 0;
+
+uint16_t pmw3610_get_orientation(void) {
+    return driver_pmw_orientation;
+}
+
+void pmw3610_set_orientation(uint16_t orientation) {
+    // 0..359に正規化
+    uint16_t o = orientation % 360;
+    driver_pmw_orientation = o;
+    // 不安定になる原因のFlash保存(settings_save_one)は行わない
+    LOG_INF("PMW3610 orientation set to %u degrees", (unsigned int)o);
+}
+// ==========================================
+
 
 // ---- 45deg rotation support (Q15 fixed point) ----
 // cos(45°) = sin(45°) ≈ 0.70710678
@@ -672,6 +687,7 @@ static int pmw3610_report_data(const struct device *dev) {
     }
 
     // 動的なorientation設定による追加回転を適用（0/45/90...315）
+    // 修正: ドライバ内の関数を呼び出す
     uint16_t dynamic_rotation = pmw3610_get_orientation();
     if (dynamic_rotation != 0) {
         int16_t rx, ry;
@@ -871,11 +887,11 @@ static int pmw3610_init(const struct device *dev) {
     return err;
 }
 
-#define TRANSFORMED_BINDINGS(n)                                                                    \
+#define TRANSFORMED_BINDINGS(n)                                                        \
     { LISTIFY(DT_PROP_LEN(n, bindings), ZMK_KEYMAP_EXTRACT_BINDING, (, ), n) }
 
-#define BALL_ACTIONS_INST(n)                                                                       \
-    static struct zmk_behavior_binding                                                             \
+#define BALL_ACTIONS_INST(n)                                                           \
+    static struct zmk_behavior_binding                                                 \
         ball_action_config_##n##_bindings[DT_PROP_LEN(n, bindings)] = TRANSFORMED_BINDINGS(n);     \
                                                                                                    \
     static struct ball_action_cfg ball_action_cfg_##n = {                                          \
