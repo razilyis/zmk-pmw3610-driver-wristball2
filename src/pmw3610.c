@@ -1,5 +1,4 @@
-/* pmw3610.c
- *
+/*
  * Copyright (c) 2022 The ZMK Contributors
  *
  * SPDX-License-Identifier: MIT
@@ -26,8 +25,6 @@
 #include <zmk/events/layer_state_changed.h>
 #include "pmw3610.h"
 
-#include <limits.h>
-
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(pmw3610, CONFIG_INPUT_LOG_LEVEL);
 
@@ -35,63 +32,6 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_INPUT_LOG_LEVEL);
 extern uint16_t pmw3610_get_orientation(void);
 extern void pmw3610_set_orientation(uint16_t orientation);
 
-// ---- 45deg rotation support (Q15 fixed point) ----
-// cos(45°) = sin(45°) ≈ 0.70710678
-#define Q15_COS45 23170 // round(0.70710678 * 32768)
-
-static inline int32_t q15_mul(int32_t v, int32_t q15) {
-    return (v * q15) >> 15;
-}
-
-static inline void rotate_xy_45step(int16_t in_x, int16_t in_y, uint16_t deg,
-                                    int16_t *out_x, int16_t *out_y) {
-    uint16_t r = (uint16_t)(deg % 360);
-
-    // 90°単位は整数変換が速いので先に処理
-    switch (r) {
-    case 0:   *out_x = in_x;  *out_y = in_y;  return;
-    case 90:  *out_x = -in_y; *out_y = in_x;  return;
-    case 180: *out_x = -in_x; *out_y = -in_y; return;
-    case 270: *out_x = in_y;  *out_y = -in_x; return;
-    default:
-        break;
-    }
-
-    // 45°刻みのみサポート（それ以外は素通し）
-    if ((r % 45) != 0) {
-        *out_x = in_x;
-        *out_y = in_y;
-        return;
-    }
-
-    // 45/135/225/315 を Q15 係数で回す
-    // x' = x*c - y*s
-    // y' = x*s + y*c
-    int32_t c = Q15_COS45;
-    int32_t s = Q15_COS45;
-
-    // 45:  c=+C, s=+C
-    // 135: c=-C, s=+C
-    // 225: c=-C, s=-C
-    // 315: c=+C, s=-C
-    if (r == 135 || r == 225) c = -c;
-    if (r == 225 || r == 315) s = -s;
-
-    int32_t X = in_x;
-    int32_t Y = in_y;
-
-    int32_t xo = q15_mul(X, c) - q15_mul(Y, s);
-    int32_t yo = q15_mul(X, s) + q15_mul(Y, c);
-
-    // 念のためクリップ（安全策）
-    if (xo > INT16_MAX) xo = INT16_MAX;
-    if (xo < INT16_MIN) xo = INT16_MIN;
-    if (yo > INT16_MAX) yo = INT16_MAX;
-    if (yo < INT16_MIN) yo = INT16_MIN;
-
-    *out_x = (int16_t)xo;
-    *out_y = (int16_t)yo;
-}
 
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
@@ -107,10 +47,17 @@ enum pmw3610_init_step {
 };
 
 /* Timings (in ms) needed in between steps to allow each step finishes succussfully. */
+// - Since MCU is not involved in the sensor init process, i is allowed to do other tasks.
+//   Thus, k_sleep or delayed schedule can be used.
 static const int32_t async_init_delay[ASYNC_INIT_STEP_COUNT] = {
-    [ASYNC_INIT_STEP_POWER_UP] = 10,
-    [ASYNC_INIT_STEP_CLEAR_OB1] = 200,
-    [ASYNC_INIT_STEP_CHECK_OB1] = 50,
+    [ASYNC_INIT_STEP_POWER_UP] = 10, // test shows > 5ms needed
+    [ASYNC_INIT_STEP_CLEAR_OB1] =
+        200,                          // 150 us required, test shows too short,
+                                      // also power-up reset is added in this step, thus using 50 ms
+    [ASYNC_INIT_STEP_CHECK_OB1] = 50, // 10 ms required in spec,
+                                      // test shows too short,
+                                      // especially when integrated with display,
+                                      // > 50ms is needed
     [ASYNC_INIT_STEP_CONFIGURE] = 0,
 };
 
@@ -128,6 +75,7 @@ static int (*const async_init_fn[ASYNC_INIT_STEP_COUNT])(const struct device *de
 
 //////// Function definitions //////////
 
+// checked and keep
 static int spi_cs_ctrl(const struct device *dev, bool enable) {
     const struct pixart_config *config = dev->config;
     int err;
@@ -148,8 +96,10 @@ static int spi_cs_ctrl(const struct device *dev, bool enable) {
     return err;
 }
 
+// checked and keep
 static int reg_read(const struct device *dev, uint8_t reg, uint8_t *buf) {
     int err;
+    /* struct pixart_data *data = dev->data; */
     const struct pixart_config *config = dev->config;
 
     __ASSERT_NO_MSG((reg & SPI_WRITE_BIT) == 0);
@@ -159,6 +109,7 @@ static int reg_read(const struct device *dev, uint8_t reg, uint8_t *buf) {
         return err;
     }
 
+    /* Write register address. */
     const struct spi_buf tx_buf = {.buf = &reg, .len = 1};
     const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1};
 
@@ -170,6 +121,7 @@ static int reg_read(const struct device *dev, uint8_t reg, uint8_t *buf) {
 
     k_busy_wait(T_SRAD);
 
+    /* Read register value. */
     struct spi_buf rx_buf = {
         .buf = buf,
         .len = 1,
@@ -195,8 +147,10 @@ static int reg_read(const struct device *dev, uint8_t reg, uint8_t *buf) {
     return 0;
 }
 
+// primitive write without enable/disable spi clock on the sensor
 static int _reg_write(const struct device *dev, uint8_t reg, uint8_t val) {
     int err;
+    /* struct pixart_data *data = dev->data; */
     const struct pixart_config *config = dev->config;
 
     __ASSERT_NO_MSG((reg & SPI_WRITE_BIT) == 0);
@@ -231,16 +185,19 @@ static int _reg_write(const struct device *dev, uint8_t reg, uint8_t val) {
 static int reg_write(const struct device *dev, uint8_t reg, uint8_t val) {
     int err;
 
+    // enable spi clock
     err = _reg_write(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
     if (unlikely(err != 0)) {
         return err;
     }
 
+    // write the target register
     err = _reg_write(dev, reg, val);
     if (unlikely(err != 0)) {
         return err;
     }
 
+    // disable spi clock to save power
     err = _reg_write(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
     if (unlikely(err != 0)) {
         return err;
@@ -251,6 +208,7 @@ static int reg_write(const struct device *dev, uint8_t reg, uint8_t val) {
 
 static int motion_burst_read(const struct device *dev, uint8_t *buf, size_t burst_size) {
     int err;
+    /* struct pixart_data *data = dev->data; */
     const struct pixart_config *config = dev->config;
 
     __ASSERT_NO_MSG(burst_size <= PMW3610_MAX_BURST_SIZE);
@@ -260,6 +218,7 @@ static int motion_burst_read(const struct device *dev, uint8_t *buf, size_t burs
         return err;
     }
 
+    /* Send motion burst address */
     uint8_t reg_buf[] = {PMW3610_REG_MOTION_BURST};
     const struct spi_buf tx_buf = {.buf = reg_buf, .len = ARRAY_SIZE(reg_buf)};
     const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1};
@@ -289,20 +248,25 @@ static int motion_burst_read(const struct device *dev, uint8_t *buf, size_t burs
         return err;
     }
 
+    /* Terminate burst */
     k_busy_wait(T_BEXIT);
 
     return 0;
 }
 
+/** Writing an array of registers in sequence, used in power-up register initialization and running
+ * mode switching */
 static int burst_write(const struct device *dev, const uint8_t *addr, const uint8_t *buf,
                        size_t size) {
     int err;
 
+    // enable spi clock
     err = _reg_write(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
     if (unlikely(err != 0)) {
         return err;
     }
 
+    /* Write data */
     for (size_t i = 0; i < size; i++) {
         err = _reg_write(dev, addr[i], buf[i]);
 
@@ -312,6 +276,7 @@ static int burst_write(const struct device *dev, const uint8_t *addr, const uint
         }
     }
 
+    // disable spi clock to save power
     err = _reg_write(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
     if (unlikely(err != 0)) {
         return err;
@@ -337,14 +302,23 @@ static int check_product_id(const struct device *dev) {
 }
 
 static int set_cpi(const struct device *dev, uint32_t cpi) {
+    /* Set resolution with CPI step of 200 cpi
+     * 0x1: 200 cpi (minimum cpi)
+     * 0x2: 400 cpi
+     * 0x3: 600 cpi
+     * :
+     */
+
     if ((cpi > PMW3610_MAX_CPI) || (cpi < PMW3610_MIN_CPI)) {
         LOG_ERR("CPI value %u out of range", cpi);
         return -EINVAL;
     }
 
+    // Convert CPI to register value
     uint8_t value = (cpi / 200);
     LOG_INF("Setting CPI to %u (reg value 0x%x)", cpi, value);
 
+    /* set the cpi */
     uint8_t addr[] = {0x7F, PMW3610_REG_RES_STEP, 0x7F};
     uint8_t data[] = {0xFF, value, 0x00};
     int err = burst_write(dev, addr, data, 3);
@@ -367,6 +341,7 @@ static int set_cpi_if_needed(const struct device *dev, uint32_t cpi) {
     return 0;
 }
 
+/* Set sampling rate in each mode (in ms) */
 static int set_sample_time(const struct device *dev, uint8_t reg_addr, uint32_t sample_time) {
     uint32_t maxtime = 2550;
     uint32_t mintime = 10;
@@ -378,6 +353,7 @@ static int set_sample_time(const struct device *dev, uint8_t reg_addr, uint32_t 
     uint8_t value = sample_time / mintime;
     LOG_INF("Set sample time to %u ms (reg value: 0x%x)", sample_time, value);
 
+    /* The sample time is (reg_value * mintime ) ms. 0x00 is rounded to 0x1 */
     int err = reg_write(dev, reg_addr, value);
     if (err) {
         LOG_ERR("Failed to change sample time");
@@ -386,22 +362,37 @@ static int set_sample_time(const struct device *dev, uint8_t reg_addr, uint32_t 
     return err;
 }
 
+/* Set downshift time in ms. */
+// NOTE: The unit of run-mode downshift is related to pos mode rate, which is hard coded to be 4 ms
+// The pos-mode rate is configured in pmw3610_async_init_configure
 static int set_downshift_time(const struct device *dev, uint8_t reg_addr, uint32_t time) {
     uint32_t maxtime;
     uint32_t mintime;
 
     switch (reg_addr) {
     case PMW3610_REG_RUN_DOWNSHIFT:
+        /*
+         * Run downshift time = PMW3610_REG_RUN_DOWNSHIFT
+         *                      * 8 * pos-rate (fixed to 4ms)
+         */
         maxtime = 32 * 255;
-        mintime = 32;
+        mintime = 32; // hard-coded in pmw3610_async_init_configure
         break;
 
     case PMW3610_REG_REST1_DOWNSHIFT:
+        /*
+         * Rest1 downshift time = PMW3610_REG_RUN_DOWNSHIFT
+         *                        * 16 * Rest1_sample_period (default 40 ms)
+         */
         maxtime = 255 * 16 * CONFIG_PMW3610_REST1_SAMPLE_TIME_MS;
         mintime = 16 * CONFIG_PMW3610_REST1_SAMPLE_TIME_MS;
         break;
 
     case PMW3610_REG_REST2_DOWNSHIFT:
+        /*
+         * Rest2 downshift time = PMW3610_REG_REST2_DOWNSHIFT
+         *                        * 128 * Rest2 rate (default 100 ms)
+         */
         maxtime = 255 * 128 * CONFIG_PMW3610_REST2_SAMPLE_TIME_MS;
         mintime = 128 * CONFIG_PMW3610_REST2_SAMPLE_TIME_MS;
         break;
@@ -418,7 +409,9 @@ static int set_downshift_time(const struct device *dev, uint8_t reg_addr, uint32
 
     __ASSERT_NO_MSG((mintime > 0) && (maxtime / mintime <= UINT8_MAX));
 
+    /* Convert time to register value */
     uint8_t value = time / mintime;
+
     LOG_INF("Set downshift time to %u ms (reg value 0x%x)", time, value);
 
     int err = reg_write(dev, reg_addr, value);
@@ -441,9 +434,11 @@ static void set_interrupt(const struct device *dev, const bool en) {
 static int pmw3610_async_init_power_up(const struct device *dev) {
     LOG_INF("async_init_power_up");
 
+    /* Reset spi port */
     spi_cs_ctrl(dev, false);
     spi_cs_ctrl(dev, true);
 
+    /* not required in datashet, but added any way to have a clear state */
     return reg_write(dev, PMW3610_REG_POWER_UP_RESET, PMW3610_POWERUP_CMD_RESET);
 }
 
@@ -482,20 +477,24 @@ static int pmw3610_async_init_configure(const struct device *dev) {
 
     int err = 0;
 
+    // clear motion registers first (required in datasheet)
     for (uint8_t reg = 0x02; (reg <= 0x05) && !err; reg++) {
         uint8_t buf[1];
         err = reg_read(dev, reg, buf);
     }
 
+    // cpi
     if (!err) {
         err = set_cpi(dev, CONFIG_PMW3610_CPI);
     }
 
+    // set performace register: run mode, vel_rate, poshi_rate, poslo_rate
     if (!err) {
         err = reg_write(dev, PMW3610_REG_PERFORMANCE, PMW3610_PERFORMANCE_VALUE);
         LOG_INF("Set performance register (reg value 0x%x)", PMW3610_PERFORMANCE_VALUE);
     }
 
+    // required downshift and rate registers
     if (!err) {
         err = set_downshift_time(dev, PMW3610_REG_RUN_DOWNSHIFT,
                                  CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS);
@@ -508,6 +507,7 @@ static int pmw3610_async_init_configure(const struct device *dev) {
                                  CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS);
     }
 
+    // downshift time for each rest mode
 #if CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS > 0
     if (!err) {
         err = set_downshift_time(dev, PMW3610_REG_REST2_DOWNSHIFT,
@@ -532,6 +532,7 @@ static int pmw3610_async_init_configure(const struct device *dev) {
     return 0;
 }
 
+// checked and keep
 static void pmw3610_async_init(struct k_work *work) {
     struct k_work_delayable *work2 = (struct k_work_delayable *)work;
     struct pixart_data *data = CONTAINER_OF(work2, struct pixart_data, init_work);
@@ -546,7 +547,7 @@ static void pmw3610_async_init(struct k_work *work) {
         data->async_init_step++;
 
         if (data->async_init_step == ASYNC_INIT_STEP_COUNT) {
-            data->ready = true;
+            data->ready = true; // sensor is ready to work
             LOG_INF("PMW3610 initialized");
             set_interrupt(dev, true);
         } else {
@@ -592,7 +593,7 @@ static enum pixart_input_mode get_input_mode_for_current_layer(const struct devi
     for (size_t i = 0; i < config->ball_actions_len; i++) {
         for (size_t j = 0; j < config->ball_actions[i]->layers_len; j++) {
             if (curr_layer == config->ball_actions[i]->layers[j]) {
-                ball_action_idx = (int)i;
+                ball_action_idx = i;
                 return BALL_ACTION;
             }
         }
@@ -623,7 +624,7 @@ static int pmw3610_report_data(const struct device *dev) {
             data->scroll_delta_x = 0;
             data->scroll_delta_y = 0;
         }
-        dividor = 1;
+        dividor = 1; // this should be handled with the ticks rather than dividors
         break;
     case SNIPE:
         set_cpi_if_needed(dev, CONFIG_PMW3610_SNIPE_CPI);
@@ -645,6 +646,15 @@ static int pmw3610_report_data(const struct device *dev) {
 
     int16_t x = 0;
     int16_t y = 0;
+
+#if AUTOMOUSE_LAYER > 0
+    if (input_mode == MOVE &&
+        (automouse_triggered || zmk_keymap_highest_layer_active() != AUTOMOUSE_LAYER) &&
+        (abs(x) + abs(y) > CONFIG_PMW3610_MOVEMENT_THRESHOLD)
+    ) {
+        activate_automouse_layer();
+    }
+#endif
 
     int err = motion_burst_read(dev, buf, sizeof(buf));
     if (err) {
@@ -670,14 +680,25 @@ static int pmw3610_report_data(const struct device *dev) {
         x = -raw_y;
         y = raw_x;
     }
-
-    // 動的なorientation設定による追加回転を適用（0/45/90...315）
+    
+    // 動的なorientation設定による追加回転を適用
     uint16_t dynamic_rotation = pmw3610_get_orientation();
     if (dynamic_rotation != 0) {
-        int16_t rx, ry;
-        rotate_xy_45step(x, y, dynamic_rotation, &rx, &ry);
-        x = rx;
-        y = ry;
+        int16_t temp_x = x, temp_y = y;
+        switch (dynamic_rotation) {
+            case 90:
+                x = -temp_y;
+                y = temp_x;
+                break;
+            case 180:
+                x = -temp_x;
+                y = -temp_y;
+                break;
+            case 270:
+                x = temp_y;
+                y = -temp_x;
+                break;
+        }
     }
 
     if (IS_ENABLED(CONFIG_PMW3610_INVERT_X)) {
@@ -693,11 +714,13 @@ static int pmw3610_report_data(const struct device *dev) {
         ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) + buf[PMW3610_SHUTTER_L_POS];
     if (data->sw_smart_flag && shutter < 45) {
         reg_write(dev, 0x32, 0x00);
+
         data->sw_smart_flag = false;
     }
 
     if (!data->sw_smart_flag && shutter > 45) {
         reg_write(dev, 0x32, 0x80);
+
         data->sw_smart_flag = true;
     }
 #endif
@@ -721,6 +744,7 @@ static int pmw3610_report_data(const struct device *dev) {
     if (x != 0 || y != 0) {
         if (input_mode == MOVE || input_mode == SNIPE) {
 #if AUTOMOUSE_LAYER > 0
+            // トラックボールの動きの大きさを計算
             int16_t movement_size = abs(x) + abs(y);
             if (input_mode == MOVE &&
                 (automouse_triggered || zmk_keymap_highest_layer_active() != AUTOMOUSE_LAYER) &&
@@ -735,15 +759,13 @@ static int pmw3610_report_data(const struct device *dev) {
             data->scroll_delta_y += y;
             if (abs(data->scroll_delta_y) > CONFIG_PMW3610_SCROLL_TICK) {
                 input_report_rel(dev, INPUT_REL_WHEEL,
-                                 data->scroll_delta_y > 0 ? PMW3610_SCROLL_Y_NEGATIVE
-                                                          : PMW3610_SCROLL_Y_POSITIVE,
+                                 data->scroll_delta_y > 0 ? PMW3610_SCROLL_Y_NEGATIVE : PMW3610_SCROLL_Y_POSITIVE,
                                  true, K_FOREVER);
                 data->scroll_delta_x = 0;
                 data->scroll_delta_y = 0;
             } else if (abs(data->scroll_delta_x) > CONFIG_PMW3610_SCROLL_TICK) {
                 input_report_rel(dev, INPUT_REL_HWHEEL,
-                                 data->scroll_delta_x > 0 ? PMW3610_SCROLL_X_NEGATIVE
-                                                          : PMW3610_SCROLL_X_POSITIVE,
+                                 data->scroll_delta_x > 0 ? PMW3610_SCROLL_X_NEGATIVE : PMW3610_SCROLL_X_POSITIVE,
                                  true, K_FOREVER);
                 data->scroll_delta_x = 0;
                 data->scroll_delta_y = 0;
@@ -754,11 +776,10 @@ static int pmw3610_report_data(const struct device *dev) {
 
             const struct pixart_config *config = dev->config;
 
-            if (ball_action_idx != -1) {
+            if(ball_action_idx != -1) {
                 const struct ball_action_cfg action_cfg = *config->ball_actions[ball_action_idx];
 
-                LOG_DBG("invoking ball action [%d], layer=%d", ball_action_idx,
-                        zmk_keymap_highest_layer_active());
+                LOG_DBG("invoking ball action [%d], layer=%d", ball_action_idx, zmk_keymap_highest_layer_active());
 
                 struct zmk_behavior_binding_event event = {
                     .position = INT32_MAX,
@@ -766,16 +787,18 @@ static int pmw3610_report_data(const struct device *dev) {
 #if IS_ENABLED(CONFIG_ZMK_SPLIT)
                     .source = ZMK_POSITION_STATE_CHANGE_SOURCE_LOCAL,
 #endif
+
                 };
 
+                // determine which binding to invoke
                 int idx = -1;
-                if (abs(data->ball_action_delta_x) > action_cfg.tick) {
+                if(abs(data->ball_action_delta_x) > action_cfg.tick) {
                     idx = data->ball_action_delta_x > 0 ? 0 : 1;
-                } else if (abs(data->ball_action_delta_y) > action_cfg.tick) {
+                } else if(abs(data->ball_action_delta_y) > action_cfg.tick) {
                     idx = data->ball_action_delta_y > 0 ? 3 : 2;
                 }
 
-                if (idx != -1) {
+                if(idx != -1) {
                     zmk_behavior_queue_add(&event, action_cfg.bindings[idx], true, action_cfg.tap_ms);
                     zmk_behavior_queue_add(&event, action_cfg.bindings[idx], false, action_cfg.wait_ms);
 
@@ -796,6 +819,7 @@ static void pmw3610_gpio_callback(const struct device *gpiob, struct gpio_callba
 
     set_interrupt(dev, false);
 
+    // submit the real handler work
     k_work_submit(&data->trigger_work);
 }
 
@@ -814,17 +838,20 @@ static int pmw3610_init_irq(const struct device *dev) {
     struct pixart_data *data = dev->data;
     const struct pixart_config *config = dev->config;
 
+    // check readiness of irq gpio pin
     if (!device_is_ready(config->irq_gpio.port)) {
         LOG_ERR("IRQ GPIO device not ready");
         return -ENODEV;
     }
 
+    // init the irq pin
     err = gpio_pin_configure_dt(&config->irq_gpio, GPIO_INPUT);
     if (err) {
         LOG_ERR("Cannot configure IRQ GPIO");
         return err;
     }
 
+    // setup and add the irq callback associated
     gpio_init_callback(&data->irq_gpio_cb, pmw3610_gpio_callback, BIT(config->irq_gpio.pin));
 
     err = gpio_add_callback(config->irq_gpio.port, &data->irq_gpio_cb);
@@ -844,11 +871,16 @@ static int pmw3610_init(const struct device *dev) {
     const struct pixart_config *config = dev->config;
     int err;
 
+    // init device pointer
     data->dev = dev;
+
+    // init smart algorithm flag;
     data->sw_smart_flag = false;
 
+    // init trigger handler work
     k_work_init(&data->trigger_work, pmw3610_work_callback);
 
+    // check readiness of cs gpio pin and init it to inactive
     if (!device_is_ready(config->cs_gpio.port)) {
         LOG_ERR("SPI CS device not ready");
         return -ENODEV;
@@ -860,16 +892,24 @@ static int pmw3610_init(const struct device *dev) {
         return err;
     }
 
+    // init irq routine
     err = pmw3610_init_irq(dev);
     if (err) {
         return err;
     }
 
+    // Setup delayable and non-blocking init jobs, including following steps:
+    // 1. power reset
+    // 2. upload initial settings
+    // 3. other configs like cpi, downshift time, sample time etc.
+    // The sensor is ready to work (i.e., data->ready=true after the above steps are finished)
     k_work_init_delayable(&data->init_work, pmw3610_async_init);
+
     k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
 
     return err;
 }
+
 
 #define TRANSFORMED_BINDINGS(n)                                                                    \
     { LISTIFY(DT_PROP_LEN(n, bindings), ZMK_KEYMAP_EXTRACT_BINDING, (, ), n) }
@@ -888,10 +928,12 @@ static int pmw3610_init(const struct device *dev) {
         .tap_ms = DT_PROP_OR(n, tap_ms, 0),                                                        \
     };
 
+
 DT_INST_FOREACH_CHILD(0, BALL_ACTIONS_INST)
 
 #define BALL_ACTIONS_ITEM(n) &ball_action_cfg_##n,
 #define BALL_ACTIONS_UTIL_ONE(n) 1 +
+
 #define BALL_ACTIONS_LEN (DT_INST_FOREACH_CHILD(0, BALL_ACTIONS_UTIL_ONE) 0)
 
 #define PMW3610_DEFINE(n)                                                                          \
