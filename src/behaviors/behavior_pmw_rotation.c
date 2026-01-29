@@ -1,5 +1,4 @@
-/* behavior_pmw_rotation.c
- *
+/*
  * Copyright (c) 2024 The ZMK Contributors
  *
  * SPDX-License-Identifier: MIT
@@ -25,51 +24,37 @@ struct behavior_pmw_rotation_data {
     uint16_t current_orientation;
 };
 
-// グローバル変数として現在の向きを管理（0,45,90,...,315）
-static uint16_t current_pmw_orientation = 0;
+// グローバル変数として現在の向きを管理
+static uint16_t current_pmw_orientation = 0; // 0, 90, 180, 270
 static bool orientation_loaded_from_settings = false;
 
 // settings用のキー
 #define PMW_ORIENTATION_SETTING_KEY "pmw/orientation"
 
-static inline bool valid_orientation(uint16_t deg) {
-    // 0..359 かつ 45度刻み
-    return (deg < 360) && ((deg % 45) == 0);
-}
-
-static inline uint16_t normalize_orientation(uint16_t deg) {
-    // 念のため0..359に丸める
-    return (uint16_t)(deg % 360);
-}
-
 // Settings handler function
 static int pmw_rotation_settings_handler(const char *key, size_t len, settings_read_cb read_cb,
                                         void *cb_arg) {
     const char *next;
-
+    
     // Parse the key to match "orientation"
     if (settings_name_steq(key, "orientation", &next) && !next) {
         // Validate data size
         if (len != sizeof(current_pmw_orientation)) {
-            LOG_WRN("Invalid orientation settings size: %d", (int)len);
+            LOG_WRN("Invalid orientation settings size: %d", len);
             return -EINVAL;
         }
-
+        
         // Read the data using the callback
         int ret = read_cb(cb_arg, &current_pmw_orientation, sizeof(current_pmw_orientation));
         if (ret >= 0) {
-            current_pmw_orientation = normalize_orientation(current_pmw_orientation);
-
-            // Validate orientation value (0,45,90,...,315)
-            if (!valid_orientation(current_pmw_orientation)) {
-                LOG_WRN("Invalid orientation value %u, using default 0",
-                        (unsigned int)current_pmw_orientation);
+            // Validate orientation value (0, 90, 180, 270)
+            if (current_pmw_orientation != 0 && current_pmw_orientation != 90 && 
+                current_pmw_orientation != 180 && current_pmw_orientation != 270) {
+                LOG_WRN("Invalid orientation value %d, using default 0", current_pmw_orientation);
                 current_pmw_orientation = 0;
             }
-
             orientation_loaded_from_settings = true;
-            LOG_INF("Loaded orientation from settings: %u degrees",
-                    (unsigned int)current_pmw_orientation);
+            LOG_INF("Loaded orientation from settings: %d degrees", current_pmw_orientation);
         } else {
             LOG_WRN("Failed to read orientation from settings: %d", ret);
         }
@@ -86,7 +71,7 @@ static int save_orientation_setting(uint16_t orientation) {
     if (ret) {
         LOG_WRN("Failed to save orientation to settings: %d", ret);
     } else {
-        LOG_DBG("Orientation %u degrees saved to settings", (unsigned int)orientation);
+        LOG_DBG("Orientation %d degrees saved to settings", orientation);
     }
     return ret;
 }
@@ -96,33 +81,23 @@ uint16_t pmw3610_get_orientation(void) {
 }
 
 void pmw3610_set_orientation(uint16_t orientation) {
-    uint16_t o = normalize_orientation(orientation);
-
-    // 45度刻み以外が来たら無視/0にする（好みで変えてOK）
-    if (!valid_orientation(o)) {
-        LOG_WRN("Reject invalid orientation %u (must be 0..359, step 45). Using 0",
-                (unsigned int)o);
-        o = 0;
-    }
-
-    current_pmw_orientation = o;
-    save_orientation_setting(o);
-    LOG_INF("PMW3610 orientation changed to %u degrees", (unsigned int)o);
+    current_pmw_orientation = orientation;
+    save_orientation_setting(orientation);
+    LOG_INF("PMW3610 orientation changed to %d degrees", orientation);
 }
 
 static int behavior_pmw_rotation_init(const struct device *dev) {
     struct behavior_pmw_rotation_data *data = dev->data;
-
-    // settings がまだロードされていないタイミングで 0 を保存して上書きしない
-    // （ロード後に settings_handler が current_pmw_orientation を反映する）
+    
+    // 設定が読み込まれていない場合は0度に設定
     if (!orientation_loaded_from_settings) {
-        current_pmw_orientation = 0; // RAM上のデフォルトだけ
+        current_pmw_orientation = 0;
+        save_orientation_setting(0);
     }
-
+    
     data->current_orientation = current_pmw_orientation;
-
-    LOG_INF("PMW rotation behavior initialized with orientation: %u",
-            (unsigned int)current_pmw_orientation);
+    
+    LOG_INF("PMW rotation behavior initialized with orientation: %d", current_pmw_orientation);
     return 0;
 }
 
@@ -133,16 +108,30 @@ static int on_keymap_binding_pressed(struct zmk_behavior_binding *binding,
 
     // 現在の角度を取得
     uint16_t current_angle = current_pmw_orientation;
-
-    // 角度を45度ずつ回転: 0 -> 45 -> ... -> 315 -> 0
-    uint16_t new_angle = (uint16_t)((current_angle + 45) % 360);
-
+    
+    // 角度を90度ずつ回転: 0 -> 90 -> 180 -> 270 -> 0
+    uint16_t new_angle;
+    switch (current_angle) {
+        case 0:
+            new_angle = 90;
+            break;
+        case 90:
+            new_angle = 180;
+            break;
+        case 180:
+            new_angle = 270;
+            break;
+        case 270:
+        default:
+            new_angle = 0;
+            break;
+    }
+    
     // 新しい角度を設定
     pmw3610_set_orientation(new_angle);
     data->current_orientation = new_angle;
-
-    LOG_INF("PMW rotation changed from %u to %u degrees",
-            (unsigned int)current_angle, (unsigned int)new_angle);
+    
+    LOG_INF("PMW rotation changed from %d to %d degrees", current_angle, new_angle);
 
     return ZMK_BEHAVIOR_OPAQUE;
 }
@@ -158,13 +147,12 @@ static const struct behavior_driver_api behavior_pmw_rotation_driver_api = {
     .binding_released = on_keymap_binding_released,
 };
 
-#define DEFINE_PMW_ROTATION(inst)                                                                  \
-    static struct behavior_pmw_rotation_data behavior_pmw_rotation_data_##inst = {};               \
-    static const struct behavior_pmw_rotation_config behavior_pmw_rotation_config_##inst = {};    \
-    BEHAVIOR_DT_INST_DEFINE(inst, behavior_pmw_rotation_init, NULL,                                \
-                            &behavior_pmw_rotation_data_##inst,                                    \
-                            &behavior_pmw_rotation_config_##inst,                                  \
-                            POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT,                      \
-                            &behavior_pmw_rotation_driver_api);
+#define DEFINE_PMW_ROTATION(inst) \
+    static struct behavior_pmw_rotation_data behavior_pmw_rotation_data_##inst = {}; \
+    static const struct behavior_pmw_rotation_config behavior_pmw_rotation_config_##inst = {}; \
+    BEHAVIOR_DT_INST_DEFINE(inst, behavior_pmw_rotation_init, NULL, \
+        &behavior_pmw_rotation_data_##inst, &behavior_pmw_rotation_config_##inst, \
+        POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, \
+        &behavior_pmw_rotation_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(DEFINE_PMW_ROTATION)
